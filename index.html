@@ -1114,7 +1114,9 @@ class Player {
     if (this.hearts <= 0) { this.hearts = 0; this.die(); }
   }
   die() {
+    if (this.dead) return;        // never re-run death (prevents repeated knockback)
     this.dead = true; this.state = PSTATE.DEAD;
+    this.onGround = false;
     this.vy = -0.8;
   }
   update(dt, game) {
@@ -1642,11 +1644,13 @@ class Game {
       }
     }
 
-    // lava pools (instakill)
-    if (this.lavaPools.length && pl.onGround && pl.invuln <= 0) {
+    // lava pools (instakill) — guard against re-killing an already-dead player
+    // (otherwise die() re-fires every frame and launches the corpse off-screen)
+    if (this.lavaPools.length && pl.onGround && pl.invuln <= 0 && !pl.dead) {
       for (const lp of this.lavaPools) {
         if (pl.x + pl.w / 2 > lp.x && pl.x + pl.w / 2 < lp.x + lp.w) {
           pl.hearts = 0; pl.die();
+          break;
         }
       }
     }
