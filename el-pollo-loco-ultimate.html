@@ -40,6 +40,23 @@ const PLAYER_G_DOWN = 0.0046;    // descending (snappy fall)
 const PLAYER_G_HANG = 0.0016;    // near apex (floaty hang time)
 const PLAYER_G_CUT  = 0.0090;    // when jump released early (variable height)
 
+// --- Player ranged attack (chili shot) ---
+const PLAYER_FIRE_CD    = 320;   // ms between shots
+const PLAYER_SHOT_SPEED = 0.62;  // px per ms (horizontal)
+const PLAYER_SHOT_DMG   = 6;     // boss damage per hit (stomp deals 8)
+const PLAYER_SHOT_R     = 9;     // projectile radius
+const PLAYER_SHOT_LIFE  = 1600;  // ms before it fizzles
+
+// --- Goal flag ---
+const FLAG_H         = 96;       // pole height (px)
+const FLAG_POLE_W    = 5;        // pole width
+const FLAG_PENNANT_W = 44;       // triangle reach to the right of the pole
+const FLAG_W         = FLAG_POLE_W + FLAG_PENNANT_W; // collision-box width
+
+// --- Hazard tuning ---
+const LAVA_FOOT_EPS  = 4;        // px tolerance: only the actual floor counts as "in lava"
+const BOSS_SAFE_FRAC = 0.5;      // feet above this fraction of boss height = safe stomp zone
+
 const STATE = {
   MENU: "MENU", PLAYING: "PLAYING", PAUSED: "PAUSED",
   SHOP: "SHOP", GAMEOVER: "GAMEOVER", VICTORY: "VICTORY"
@@ -154,6 +171,7 @@ class AudioEngine {
   explosion() { this.noise(0.35, 0.4); this.tone(120, 0.3, "sawtooth", 0.25, 40); }
   powerup() { this.tone(523, 0.08, "triangle", 0.2); setTimeout(() => this.tone(784, 0.12, "triangle", 0.2), 80); }
   buy() { this.tone(440, 0.06, "square", 0.2, 660); setTimeout(() => this.tone(880, 0.1, "square", 0.2), 60); }
+  playerShot() { this.tone(520, 0.07, "square", 0.16, 920); }
   gameOver() {
     [523, 440, 349, 261].forEach((f, i) => setTimeout(() => this.tone(f, 0.3, "sawtooth", 0.22), i * 200));
   }
@@ -190,7 +208,8 @@ const Audio = new AudioEngine();
 const Input = {
   keys: {},
   left: false, right: false, jump: false, jumpPressed: false, dash: false, dashPressed: false,
-  _prevJump: false, _prevDash: false,
+  fire: false, firePressed: false,
+  _prevJump: false, _prevDash: false, _prevFire: false,
   touchButtons: [], // filled by HUD
   init(canvas) {
     window.addEventListener("keydown", (e) => {
@@ -207,19 +226,24 @@ const Input = {
     const kbRight = k["ArrowRight"] || k["KeyD"];
     const kbJump = k["ArrowUp"] || k["KeyW"] || k["Space"];
     const kbDash = k["ShiftLeft"] || k["ShiftRight"] || k["KeyK"];
+    const kbFire = k["KeyX"] || k["KeyJ"];
     // merge keyboard + touch flags
     this.left = kbLeft || this._tLeft;
     this.right = kbRight || this._tRight;
     const jumpNow = kbJump || this._tJump;
     const dashNow = kbDash || this._tDash;
+    const fireNow = kbFire || this._tFire;
     this.jumpPressed = jumpNow && !this._prevJump;
     this.dashPressed = dashNow && !this._prevDash;
+    this.firePressed = fireNow && !this._prevFire;
     this.jump = jumpNow;
     this.dash = dashNow;
+    this.fire = fireNow;
     this._prevJump = jumpNow;
     this._prevDash = dashNow;
+    this._prevFire = fireNow;
   },
-  _tLeft: false, _tRight: false, _tJump: false, _tDash: false
+  _tLeft: false, _tRight: false, _tJump: false, _tDash: false, _tFire: false
 };
 
 /* ----------------------------- Particles -------------------------------- */
@@ -334,6 +358,44 @@ class Platform {
   }
 }
 
+/* ----------------------------- Goal Flag -------------------------------- */
+// A real world object. Level completes on AABB collision with `box` — never on
+// a coordinate threshold. The collision box is anchored to the pole so it lines
+// up exactly with the drawn sprite (verify with debug draw, toggle `).
+class Flag {
+  constructor(poleX, groundY) {
+    this.poleX = poleX;
+    this.groundY = groundY;
+    this.x = poleX;                 // collision-box left edge = pole
+    this.y = groundY - FLAG_H;
+    this.w = FLAG_W;
+    this.h = FLAG_H;
+    this.wave = 0;
+    this.reached = false;
+  }
+  get box() { return { x: this.x, y: this.y, w: this.w, h: this.h }; }
+  update(dt) { this.wave += dt * 0.006; }
+  draw(ctx) {
+    const px = this.poleX, top = this.groundY - FLAG_H;
+    // pole
+    ctx.fillStyle = "#f5f5f5";
+    ctx.fillRect(px, top, FLAG_POLE_W, FLAG_H);
+    ctx.fillStyle = "#cfcfcf";
+    ctx.fillRect(px, top, FLAG_POLE_W, 4);
+    // finial
+    ctx.fillStyle = "#ffd700";
+    ctx.beginPath(); ctx.arc(px + FLAG_POLE_W / 2, top, 5, 0, Math.PI * 2); ctx.fill();
+    // waving green pennant near the top
+    const sway = Math.sin(this.wave) * 5;
+    ctx.fillStyle = this.reached ? "#19a23a" : "#00cc44";
+    ctx.beginPath();
+    ctx.moveTo(px + FLAG_POLE_W, top + 8);
+    ctx.lineTo(px + FLAG_POLE_W + FLAG_PENNANT_W, top + 22 + sway);
+    ctx.lineTo(px + FLAG_POLE_W, top + 36);
+    ctx.closePath(); ctx.fill();
+  }
+}
+
 /* ----------------------------- Coins ------------------------------------ */
 const COIN_TYPES = {
   bronze:   { value: 1,  r: 11, color: "#cd7f32", shine: "#f0b070", rare: 0.55 },
@@ -375,14 +437,14 @@ class Coin {
   // bounding box for AABB uses center
   get bx() { return this.x - this.r; }
   get by() { return this.y - this.r; }
-  collide(platforms) {
+  collide(platforms, dt) {
     if (this.landed) return;
     const t = COIN_TYPES[this.type];
-    this.vy += GRAVITY * dt0 * 1;
-    this.y += this.vy * dt0;
+    this.vy += GRAVITY * dt * 1;
+    this.y += this.vy * dt;
     for (const p of platforms) {
       if (this.x > p.x && this.x < p.x + p.w &&
-          this.y + this.r > p.y && this.y + this.r < p.y + p.h + 30 && this.vy > 0) {
+          this.y + this.r > p.y && this.y + this.r < p.y + p.h + 50 && this.vy > 0) {
         this.y = p.y - this.r;
         this.vy *= -0.5;
         if (Math.abs(this.vy) < 0.05) { this.vy = 0; this.landed = true; }
@@ -412,7 +474,7 @@ class Coin {
     if (this.collected) return;
 
     // gravity/bounce
-    this.collide(game.platforms);
+    this.collide(game.platforms, dt);
   }
   draw(ctx) {
     if (this.collected && !this.flying) return;
@@ -451,7 +513,6 @@ class Coin {
     }
   }
 }
-let dt0 = 16; // shared dt for coin.collide convenience (set each frame)
 
 /* ----------------------------- Projectiles ------------------------------ */
 class Projectile {
@@ -463,9 +524,12 @@ class Projectile {
     this.gravity = opts.gravity || 0;
     this.life = opts.life || 5000;
     this.fromBoss = !!opts.fromBoss;
+    this.fromPlayer = !!opts.fromPlayer;   // player chili shot
     this.damage = opts.damage || 1;
     this.color = opts.color || "#ff7b00";
     this.feather = !!opts.feather;
+    this.chili = !!opts.chili;             // render as a thrown chili pepper
+    this.spin = 0;
   }
   isAlive() { return !this.dead; }
   get bx() { return this.x - this.r; }
@@ -483,6 +547,26 @@ class Projectile {
   }
   draw(ctx) {
     ctx.save();
+    if (this.chili) {
+      // thrown chili pepper — spins as it flies, leaves a spicy glow
+      ctx.translate(this.x, this.y);
+      ctx.rotate(Math.atan2(this.vy, this.vx) + (this.vx < 0 ? Math.PI : 0));
+      const r = this.r;
+      const glow = ctx.createRadialGradient(0, 0, 1, 0, 0, r * 1.8);
+      glow.addColorStop(0, "rgba(255,180,60,0.6)"); glow.addColorStop(1, "rgba(255,80,0,0)");
+      ctx.fillStyle = glow;
+      ctx.beginPath(); ctx.arc(0, 0, r * 1.8, 0, Math.PI * 2); ctx.fill();
+      // body (curved red chili)
+      ctx.fillStyle = this.color;
+      ctx.beginPath(); ctx.ellipse(0, 0, r * 1.4, r * 0.6, 0, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = "#ffd27f"; // highlight
+      ctx.beginPath(); ctx.ellipse(-r * 0.3, -r * 0.18, r * 0.5, r * 0.18, 0, 0, Math.PI * 2); ctx.fill();
+      // green stem
+      ctx.strokeStyle = "#2faa2f"; ctx.lineWidth = 3; ctx.lineCap = "round";
+      ctx.beginPath(); ctx.moveTo(r * 1.3, 0); ctx.lineTo(r * 1.7, -r * 0.4); ctx.stroke();
+      ctx.restore();
+      return;
+    }
     if (this.feather) {
       ctx.translate(this.x, this.y);
       ctx.rotate(Math.atan2(this.vy, this.vx));
@@ -755,6 +839,7 @@ class Boss {
     if (this.hp <= 0) { this.hp = 0; this.die(); }
   }
   die() {
+    if (this.dead) return;       // FIX: doppeltes die() verhindern (Dash + Projektil im selben Frame)
     this.dead = true;
     for (let i = 0; i < 60; i++) {
       this.game.particles.emit({ x: this.x + this.w / 2, y: this.y + this.h / 2, count: 1,
@@ -779,8 +864,7 @@ class Boss {
     } else if (p === 3) {
       this.transitionMsg = "¡AHORA MUERES!";
       this.transitionTime = 2000; this.stateTimer = 2000;
-      this.applyScale(3.5 / 3); // grow from 3x baseline... actually scale baseline is 1 (=3x player). Use 1.17 -> represents extra growth
-      this.applyScale(1.17);
+      this.applyScale(1.17);     // FIX: nur einmal skalieren (vorher 2x → Boss 1.37x statt 1.17x)
       Shake.add(2000, 9);
       safe(() => Audio.bpmMul = 1.8, "boss.bpm3");
       this.game.freeze = 800;
@@ -1072,10 +1156,12 @@ class Player {
     this.coyote = 0; this.jumpBuffer = 0;
     this.jumpsLeft = 1;
     this.dashCooldown = 0; this.dashTime = 0; this.airDashLeft = 0;
+    this.fireCooldown = 0;
     this.animPhase = 0;
     this.dead = false;
     this.shield = false;
     this.hurtFlash = 0;
+    this.onFloor = false;   // standing on the actual ground floor (NOT a platform) — used by lava
   }
   isAlive() { return !this.dead; }
   get bx() { return this.x; } get by() { return this.y; }
@@ -1083,7 +1169,8 @@ class Player {
   reset(x, y) {
     this.x = x; this.y = y; this.prevY = y; this.vx = 0; this.vy = 0;
     this.state = PSTATE.IDLE; this.invuln = 0; this.dead = false;
-    this.coyote = 0; this.jumpBuffer = 0; this.onGround = false;
+    this.coyote = 0; this.jumpBuffer = 0; this.onGround = false; this.onFloor = false;
+    this.fireCooldown = 0;
   }
   applyUpgrades(u) {
     this.maxJumps = u.doubleJump ? 2 : 1;
@@ -1169,6 +1256,13 @@ class Player {
       }
     }
 
+    // Ranged attack — throw a chili (X / J)
+    if (this.fireCooldown > 0) this.fireCooldown -= dt;
+    if (Input.firePressed && this.fireCooldown <= 0) {
+      this.fireCooldown = PLAYER_FIRE_CD;
+      game.spawnPlayerShot(this);
+    }
+
     // Jump buffering + coyote
     if (Input.jumpPressed) this.jumpBuffer = 100;
     if (this.jumpBuffer > 0) this.jumpBuffer -= dt;
@@ -1203,12 +1297,15 @@ class Player {
     // world bounds
     this.x = clamp(this.x, 0, WORLD_W - this.w);
 
-    // platform + ground collisions
+    // platform + ground collisions. Platforms are resolved AFTER the floor so a
+    // platform landing always wins; `onFloor` stays true ONLY for the real floor,
+    // which is what lava damage keys off of (a platform above lava is safe).
     this.onGround = false;
+    this.onFloor = false;
     // ground
     const gy = game.groundY - this.h;
     // lava floor in level 2/3 handled by game (instakill). Standard ground:
-    if (!game.noFloor && this.y >= gy) { this.y = gy; this.vy = 0; this.onGround = true; }
+    if (!game.noFloor && this.y >= gy) { this.y = gy; this.vy = 0; this.onGround = true; this.onFloor = true; }
 
     // land on platform tops only when descending and feet were above the top last frame
     if (this.vy >= 0) {
@@ -1357,6 +1454,7 @@ class Game {
     this.coinHudPulse = 0;
     this.screenFlash = 0;
     this.flyingCoins = [];   // tween coins to HUD
+    this.debug = false;      // hitbox debug overlay (toggle with `)
     this.transitionText = ""; this.transitionTextTime = 0;
     this.resetWorld();
     this.bindUI();
@@ -1372,7 +1470,9 @@ class Game {
     this.boss = null;
     this.lavaPools = [];
     this.dangerZone = null;
+    this.flag = null;
     this.noFloor = false;
+    this._deathTimer = 0;        // FIX: kein State-Bleed des Todes-Timers über Neustarts
     this.particles.clear();
   }
 
@@ -1455,6 +1555,7 @@ class Game {
     const top = this.platforms[2];
     this.enemies.push(new Chicken(top.x + 20, top.y - 42, { speed: 0.05, platform: top }));
     this.goalX = WORLD_W - 70;
+    this.flag = new Flag(this.goalX, this.groundY);   // collide with THIS to finish the level
   }
   buildLevel2() {
     this.noFloor = false;
@@ -1484,7 +1585,11 @@ class Game {
     this.enemies.push(new Chicken(640, g - 42, { fire: true, speed: 0.05 }));
     this.enemies.push(new Chicken(1080, g - 42, { fire: true, speed: 0.05 }));
     this.lavaBubbleTimer = 2500;
+    // FIX: Stalaktit-Höhen einmalig festlegen (vorher rand() pro Frame → Flackern)
+    this.stalactites = [];
+    for (let x = 0; x < WORLD_W; x += 120) this.stalactites.push({ x, h: rand(60, 120) });
     this.goalX = WORLD_W - 70;
+    this.flag = new Flag(this.goalX, this.groundY);   // collide with THIS to finish the level
   }
   buildLevel3() {
     this.noFloor = false;
@@ -1504,6 +1609,19 @@ class Game {
     safe(() => Audio.powerup(), "rainbow");
   }
 
+  spawnPlayerShot(pl) {
+    const dir = pl.facing;
+    const x = pl.x + pl.w / 2 + dir * (pl.w * 0.55);
+    const y = pl.y + pl.h * 0.42;
+    this.projectiles.push(new Projectile(x, y, dir * PLAYER_SHOT_SPEED, 0, {
+      r: PLAYER_SHOT_R, chili: true, fromPlayer: true, damage: PLAYER_SHOT_DMG,
+      life: PLAYER_SHOT_LIFE, color: "#ff3b2e"
+    }));
+    safe(() => Audio.playerShot(), "player.shot");
+    this.particles.emit({ x, y, count: 4, speedMin: 0.05, speedMax: 0.15, lifeMin: 100, lifeMax: 250,
+      color: () => ["#ffcc33", "#ff5522"][randi(0, 1)], sizeMin: 2, sizeMax: 4 });
+  }
+
   /* ---- coin collection ---- */
   collectCoin(c) {
     const t = COIN_TYPES[c.type];
@@ -1513,7 +1631,7 @@ class Game {
     this.score += gained * 10;
     this.coinsTotal += gained;
     this.coinHudPulse = 250;
-    c.collected = true; c.flying = false; c.dead = true;
+    c.collected = true; c.dead = true;   // FIX: c.flying nicht mehr überschreiben (Tween-Guard inkonsistent)
     safe(() => Audio.coin(Math.min(this.combo.streak, 8)), "collect");
     // flying tween visual
     this.flyingCoins.push({ x: c.x, y: c.y, t: 0, type: c.type, sx: c.x, sy: c.y });
@@ -1539,7 +1657,6 @@ class Game {
 
     if (this.freeze > 0) { this.freeze -= dt; this.particles.update(dt); return; }
 
-    dt0 = dt;
     this.elapsed = performance.now() - this.startTime;
 
     const pl = this.player;
@@ -1596,18 +1713,26 @@ class Game {
     if (this.boss && this.boss.isAlive()) {
       this.boss.update(dt, this);
       const b = this.boss;
-      // player damages boss by dashing or jumping on it
+      // player damages boss by dashing or jumping on it.
+      // The TOP of the boss is a hard safe zone: whenever the player's feet are
+      // above the boss midline they either stomp (if descending) or pass safely —
+      // they NEVER take a hit. Damage only happens on genuine lateral/below contact.
       if (aabb(b, pl) && !pl.dead) {
-        const cameFromAbove = (pl.prevY + pl.h) <= b.y + b.h * 0.45;
+        const feetY = pl.y + pl.h;
+        const safeLine = b.y + b.h * BOSS_SAFE_FRAC;
+        const onTop = feetY <= safeLine;                       // current-frame geometry (robust to boss moving)
+        const cameFromAbove = (pl.prevY + pl.h) <= safeLine;
         const descending = pl.vy > -0.06;
         const dashing = pl.dashTime > 0;
         const vulnerable = b.exhausted > 0;
-        if (dashing || (cameFromAbove && descending)) {
+        if (dashing || ((onTop || cameFromAbove) && descending)) {
           b.hurt(vulnerable ? 16 : 8);
           pl.vy = pl.jumpVel * 0.6;          // bounce off the boss
           pl.onGround = false; pl.coyote = 0;
+        } else if (onTop) {
+          // standing or rising on the boss's head — safe, deal no damage
         } else if (pl.invuln <= 0) {
-          pl.takeHit(1);
+          pl.takeHit(1);                     // real side / frontal contact
         }
       }
     } else if (this.boss && this.boss.dead) {
@@ -1624,6 +1749,23 @@ class Game {
         pr.dead = true; pl.takeHit(1);
         this.particles.emit({ x: pr.x, y: pr.y, count: 12, speedMin: 0.1, speedMax: 0.3,
           lifeMin: 200, lifeMax: 400, color: () => ["#ff6600", "#ffcc00"][randi(0, 1)], sizeMin: 3, sizeMax: 6 });
+      } else if (pr.fromPlayer) {
+        // chili hits the boss
+        if (this.boss && this.boss.isAlive() && aabb(pb, this.boss)) {
+          pr.dead = true;
+          this.boss.hurt(this.boss.exhausted > 0 ? pr.damage * 2 : pr.damage);
+          this.score += 15;
+          this.particles.emit({ x: pr.x, y: pr.y, count: 10, speedMin: 0.1, speedMax: 0.35,
+            lifeMin: 150, lifeMax: 400, color: () => ["#fff", "#ffcc00", "#ff5500"][randi(0, 2)], sizeMin: 2, sizeMax: 6 });
+        } else {
+          // chili hits a chicken
+          for (const e of this.enemies) {
+            if (!e.dead && aabb(pb, e)) {
+              pr.dead = true; e.hurt(e.mini ? 4 : 999, this); this.score += 20;
+              break;
+            }
+          }
+        }
       }
     }
 
@@ -1632,21 +1774,23 @@ class Game {
       hz.update(dt, this);
       if (hz.dead) continue;
       if (hz instanceof Shockwave) {
-        const onGround = pl.onGround;
+        // ground ring — only dangerous while standing on the floor (platforms are safe)
         const ring = Math.abs(dist(pl.x + pl.w / 2, this.groundY, hz.x, this.groundY) - hz.r);
-        if (onGround && ring < 25 && pl.invuln <= 0) pl.takeHit(1);
+        if (pl.onFloor && ring < 25 && pl.invuln <= 0) pl.takeHit(1);
       } else if (hz instanceof FirePatch) {
         if (aabb({ x: hz.x, y: hz.y - 10, w: hz.w, h: hz.h + 10 }, pl) && pl.invuln <= 0) pl.takeHit(1);
       } else if (hz instanceof LavaBubble || hz instanceof Meteor) {
-        if (hz.active !== false && !hz.warn > 0) {}
-        const hb = { x: hz.bx, y: hz.by, w: hz.w, h: hz.h };
-        if ((hz.warn === undefined || hz.warn <= 0) && aabb(hb, pl) && pl.invuln <= 0) pl.takeHit(1);
+        // FIX: warn-Phase korrekt überspringen (alter Guard `!hz.warn > 0` war immer false)
+        if (hz.warn <= 0 && !hz.exploded && aabb({ x: hz.bx, y: hz.by, w: hz.w, h: hz.h }, pl) && pl.invuln <= 0)
+          pl.takeHit(1);
       }
     }
 
-    // lava pools (instakill) — guard against re-killing an already-dead player
-    // (otherwise die() re-fires every frame and launches the corpse off-screen)
-    if (this.lavaPools.length && pl.onGround && pl.invuln <= 0 && !pl.dead) {
+    // lava pools (instakill). Uses pl.onFloor (NOT onGround) so standing on a
+    // platform above the lava is safe — platform collision is resolved first in
+    // Player.update, then this checks only the real floor. Guard against
+    // re-killing an already-dead player (else die() re-fires and flings the corpse).
+    if (this.lavaPools.length && pl.onFloor && pl.invuln <= 0 && !pl.dead) {
       for (const lp of this.lavaPools) {
         if (pl.x + pl.w / 2 > lp.x && pl.x + pl.w / 2 < lp.x + lp.w) {
           pl.hearts = 0; pl.die();
@@ -1667,7 +1811,7 @@ class Game {
     // level 3 phase-3 danger zone (center floor)
     if (this.level === 3 && this.boss && this.boss.phase === 3 && this.boss.isAlive()) {
       if (!this.dangerZone) this.dangerZone = { x: WORLD_W * 0.35, w: WORLD_W * 0.3 };
-      if (pl.onGround && pl.invuln <= 0 &&
+      if (pl.onFloor && pl.invuln <= 0 &&
           pl.x + pl.w / 2 > this.dangerZone.x && pl.x + pl.w / 2 < this.dangerZone.x + this.dangerZone.w) {
         pl.takeHit(1);
       }
@@ -1715,9 +1859,14 @@ class Game {
       if (this._deathTimer > 1200) this.lose();
     }
 
-    // level complete (reach goal)
-    if (this.goalX > 0 && pl.x + pl.w > this.goalX && !pl.dead) {
-      this.completeLevel();
+    // level complete — ONLY on real AABB collision with the flag object
+    // (never a coordinate threshold or screen edge).
+    if (this.flag && !pl.dead) {
+      this.flag.update(dt);
+      if (aabb(pl, this.flag.box)) {
+        this.flag.reached = true;
+        this.completeLevel();
+      }
     }
   }
 
@@ -1804,10 +1953,10 @@ class Game {
       const g = ctx.createLinearGradient(0, 0, 0, WORLD_H);
       g.addColorStop(0, "#3a0a0a"); g.addColorStop(0.5, "#7a1500"); g.addColorStop(1, "#ff5500");
       ctx.fillStyle = g; ctx.fillRect(0, 0, WORLD_W, WORLD_H);
-      // cave stalactites
+      // cave stalactites (stabile, vorab berechnete Höhen)
       ctx.fillStyle = "#2a0505";
-      for (let x = 0; x < WORLD_W; x += 120) {
-        ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x + 40, rand(60, 120)); ctx.lineTo(x + 80, 0); ctx.fill();
+      for (const s of (this.stalactites || [])) {
+        ctx.beginPath(); ctx.moveTo(s.x, 0); ctx.lineTo(s.x + 40, s.h); ctx.lineTo(s.x + 80, 0); ctx.fill();
       }
     } else {
       const g = ctx.createLinearGradient(0, 0, 0, WORLD_H);
@@ -1854,13 +2003,8 @@ class Game {
       ctx.fillRect(this.dangerZone.x, this.groundY - 20, this.dangerZone.w, 20);
       ctx.restore();
     }
-    // goal flag
-    if (this.goalX > 0) {
-      ctx.fillStyle = "#fff"; ctx.fillRect(this.goalX, this.groundY - 90, 4, 90);
-      ctx.fillStyle = "#00cc44"; ctx.beginPath();
-      ctx.moveTo(this.goalX + 4, this.groundY - 90); ctx.lineTo(this.goalX + 44, this.groundY - 75);
-      ctx.lineTo(this.goalX + 4, this.groundY - 60); ctx.fill();
-    }
+    // goal flag (real object — sprite drawn from the same coords as its hitbox)
+    if (this.flag) this.flag.draw(ctx);
   }
   drawWorld(ctx) {
     this.drawBackground(ctx);
@@ -1883,6 +2027,38 @@ class Game {
       ctx.fillText(this.boss.transitionMsg, WORLD_W / 2, WORLD_H / 2);
       ctx.restore();
     }
+    if (this.debug) this.drawDebug(ctx);
+  }
+  // Debug hitbox overlay — toggle with the backtick (`) key. Boxes are the exact
+  // bounding boxes used for collision, so misalignment with a sprite is visible.
+  drawDebug(ctx) {
+    ctx.save();
+    ctx.lineWidth = 1.5;
+    ctx.font = "10px monospace"; ctx.textAlign = "left"; ctx.textBaseline = "alphabetic";
+    const box = (o, col, label) => {
+      if (!o) return;
+      const x = (o.bx !== undefined ? o.bx : o.x);
+      const y = (o.by !== undefined ? o.by : o.y);
+      ctx.strokeStyle = col; ctx.strokeRect(x, y, o.w, o.h);
+      if (label) { ctx.fillStyle = col; ctx.fillText(label, x, y - 2); }
+    };
+    for (const lp of this.lavaPools) { ctx.strokeStyle = "#ff0000"; ctx.strokeRect(lp.x, this.groundY, lp.w, 18); }
+    if (this.dangerZone) { ctx.strokeStyle = "#ff5500"; ctx.strokeRect(this.dangerZone.x, this.groundY - 20, this.dangerZone.w, 20); }
+    for (const p of this.platforms) { ctx.strokeStyle = "#3388ff"; ctx.strokeRect(p.x, p.y, p.w, p.h); }
+    for (const c of this.coins) box({ bx: c.x - c.r, by: c.y - c.r, w: c.r * 2, h: c.r * 2 }, "#ffee55");
+    for (const hz of this.hazards) box(hz, "#ff8800");
+    for (const pr of this.projectiles) box(pr, pr.fromPlayer ? "#88ff00" : "#ff4400");
+    for (const e of this.enemies) box(e, "#ffaa00", e.mini ? "m" : "chk");
+    if (this.boss && this.boss.isAlive()) {
+      box(this.boss, "#ff00ff", "BOSS");
+      const sy = this.boss.y + this.boss.h * BOSS_SAFE_FRAC;
+      ctx.strokeStyle = "#00ff00"; ctx.setLineDash([6, 4]);
+      ctx.beginPath(); ctx.moveTo(this.boss.x, sy); ctx.lineTo(this.boss.x + this.boss.w, sy); ctx.stroke();
+      ctx.setLineDash([]);
+    }
+    if (this.flag) { const f = this.flag.box; ctx.strokeStyle = "#00ffff"; ctx.strokeRect(f.x, f.y, f.w, f.h); ctx.fillStyle = "#00ffff"; ctx.fillText("FLAG", f.x, f.y - 2); }
+    if (this.player) box(this.player, "#00ff88", "P" + (this.player.onFloor ? " floor" : (this.player.onGround ? " plat" : "")));
+    ctx.restore();
   }
   drawComboOverPlayer(ctx) {
     if (!this.combo || this.combo.streak < 2 || !this.player) return;
@@ -2030,7 +2206,7 @@ class Game {
     ctx.fillStyle = "#fff"; ctx.font = "18px sans-serif";
     ctx.fillText("Gesamtmünzen: " + this.coinsTotal + "   |   Highscore: " + this.highScore, WORLD_W / 2, 560);
     ctx.font = "15px sans-serif"; ctx.fillStyle = "rgba(255,255,255,0.85)";
-    ctx.fillText("WASD / Pfeile = Bewegen  •  W/↑/Leer = Springen  •  Shift = Dash  •  P = Pause", WORLD_W / 2, 600);
+    ctx.fillText("WASD / Pfeile = Bewegen  •  W/↑/Leer = Springen  •  Shift = Dash  •  X = Chili werfen  •  P = Pause", WORLD_W / 2, 600);
     ctx.fillText("Sammle Münzen, baue Combos, kaufe Upgrades, besiege EL DIABLO POLLO!", WORLD_W / 2, 624);
   }
   drawButton(ctx, label, cx, cy, w, h, id) {
@@ -2152,10 +2328,11 @@ class Game {
         else if (this.state === STATE.GAMEOVER || this.state === STATE.VICTORY) this.onButton("restart");
         else if (this.state === STATE.SHOP) this.onButton("next");
       }
+      if (e.code === "Backquote") this.debug = !this.debug;   // toggle hitbox debug overlay
     });
   }
   onButton(id) {
-    safe(() => Audio.buy(), "btn");
+    // FIX: Kauf-Sound nicht mehr bei jedem Klick — nur bei erfolgreichem Kauf (siehe buy:-Zweig)
     if (id === "start") { this.runCoins = 0; this.score = 0; this.player = new Player(this); this.startLevel(1); }
     else if (id === "resume") this.state = STATE.PLAYING;
     else if (id === "quit") { this.state = STATE.MENU; safe(() => Audio.stopMusic(), "q"); }
@@ -2172,6 +2349,7 @@ class Game {
       if (up && !this.upgrades[key] && this.runCoins >= up.cost) {
         this.runCoins -= up.cost; this.upgrades[key] = true;
         Store.set("upgrades", this.upgrades);
+        safe(() => Audio.buy(), "buy");   // FIX: Sound nur bei erfolgreichem Kauf
       }
     }
   }
@@ -2182,7 +2360,7 @@ class Game {
     this.touchBtns = [];
     this.layoutTouch();
     const setFlags = (touches) => {
-      let l = false, r = false, j = false, d = false;
+      let l = false, r = false, j = false, d = false, f = false;
       for (const b of this.touchBtns) b.active = false;
       for (const t of touches) {
         const p = this.toWorld(t.clientX, t.clientY);
@@ -2193,10 +2371,11 @@ class Game {
             if (b.id === "right") r = true;
             if (b.id === "jump") j = true;
             if (b.id === "dash") d = true;
+            if (b.id === "fire") f = true;
           }
         }
       }
-      Input._tLeft = l; Input._tRight = r; Input._tJump = j; Input._tDash = d;
+      Input._tLeft = l; Input._tRight = r; Input._tJump = j; Input._tDash = d; Input._tFire = f;
     };
     const onTouch = (e) => {
       Audio.resume();
@@ -2225,6 +2404,7 @@ class Game {
     this.touchBtns = [
       { id: "left", label: "‹", x: 90, y: by, r, active: false },
       { id: "right", label: "›", x: 210, y: by, r, active: false },
+      { id: "fire", label: "🌶", x: WORLD_W - 90, y: by - 110, r: 40, active: false },
       { id: "dash", label: "»", x: WORLD_W - 90, y: by, r, active: false },
       { id: "jump", label: "▲", x: WORLD_W - 210, y: by, r, active: false }
     ];
